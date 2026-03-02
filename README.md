@@ -34,7 +34,14 @@ You can switch between two display modes from the Tampermonkey menu:
 
 Available modes:
 - **Local time**: shows the converted timestamp in your local timezone
-- **Relative time**: shows elapsed time such as `53s ago`, `2min ago` or `1h ago`
+- **Relative time**: shows elapsed time such as `53s ago`, `2m ago` or `1h ago`
+
+### Auto refresh
+
+- The page soft-refreshes on a configurable interval while the tab is visible
+- The default interval is 60 seconds
+- You can change it from the Tampermonkey menu via **“Set auto-refresh interval”**
+- Setting the interval to `0` disables auto-refresh
 
 ### Custom date pattern
 
