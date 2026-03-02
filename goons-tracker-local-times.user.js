@@ -299,7 +299,7 @@
             unit = "h";
         } else if (totalSeconds >= 60) {
             value = Math.floor(totalSeconds / 60);
-            unit = "min";
+            unit = "m";
         }
 
         return isPast ? `${value}${unit} ago` : `in ${value} ${unit}`;
