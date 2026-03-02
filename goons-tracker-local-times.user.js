@@ -8,7 +8,7 @@
 // @downloadURL     https://github.com/Tosox/goons-tracker-local-times/releases/latest/download/goons-tracker-local-times.user.js
 // @icon            https://github.com/Tosox/goons-tracker-local-times/blob/master/assets/icon.png?raw=true
 // @description     Converts Goons tracker timestamps into your local time or relative elapsed time
-// @version         1.1.0
+// @version         1.2.0
 // @license         MIT
 // @copyright       Copyright (c) 2026 Tosox
 // @match           https://www.goon-tracker.com/*
@@ -27,6 +27,7 @@
     const SETTINGS_KEY = "gt_local_times_settings";
     const DEFAULT_PATTERN = "dd.MM.yyyy, HH:mm:ss";
     const DEFAULT_DISPLAY_MODE = "local";
+    const DEFAULT_AUTO_REFRESH_INTERVAL_SECONDS = 60;
     const PROCESSED_ATTR = "data-localized-time";
     const ORIGINAL_ATTR = "data-localized-time-original";
     const UTC_MS_ATTR = "data-localized-time-utc";
@@ -53,12 +54,22 @@
         return value === DISPLAY_MODES.RELATIVE ? DISPLAY_MODES.RELATIVE : DISPLAY_MODES.LOCAL;
     }
 
+    function normalizeAutoRefreshIntervalSeconds(value) {
+        const seconds = Number.parseInt(value, 10);
+        if (!Number.isFinite(seconds) || seconds < 0) {
+            return DEFAULT_AUTO_REFRESH_INTERVAL_SECONDS;
+        }
+
+        return seconds;
+    }
+
     function readSettings() {
         const raw = GM_getValue(SETTINGS_KEY, null);
         if (!raw) {
             return {
                 pattern: "",
-                displayMode: DEFAULT_DISPLAY_MODE
+                displayMode: DEFAULT_DISPLAY_MODE,
+                autoRefreshIntervalSeconds: DEFAULT_AUTO_REFRESH_INTERVAL_SECONDS
             };
         }
 
@@ -66,12 +77,14 @@
             const obj = (typeof raw === "string" ? JSON.parse(raw) : raw);
             return {
                 pattern: (obj?.pattern ?? ""),
-                displayMode: normalizeDisplayMode(obj?.displayMode)
+                displayMode: normalizeDisplayMode(obj?.displayMode),
+                autoRefreshIntervalSeconds: normalizeAutoRefreshIntervalSeconds(obj?.autoRefreshIntervalSeconds)
             };
         } catch {
             return {
                 pattern: "",
-                displayMode: DEFAULT_DISPLAY_MODE
+                displayMode: DEFAULT_DISPLAY_MODE,
+                autoRefreshIntervalSeconds: DEFAULT_AUTO_REFRESH_INTERVAL_SECONDS
             };
         }
     }
@@ -80,7 +93,10 @@
         const current = readSettings();
         const merged = {
             pattern: (next?.pattern ?? current.pattern ?? ""),
-            displayMode: normalizeDisplayMode(next?.displayMode ?? current.displayMode)
+            displayMode: normalizeDisplayMode(next?.displayMode ?? current.displayMode),
+            autoRefreshIntervalSeconds: normalizeAutoRefreshIntervalSeconds(
+                next?.autoRefreshIntervalSeconds ?? current.autoRefreshIntervalSeconds
+            )
         };
         GM_setValue(SETTINGS_KEY, JSON.stringify(merged));
         return merged;
@@ -88,6 +104,10 @@
 
     function getDisplayMode() {
         return normalizeDisplayMode(readSettings().displayMode);
+    }
+
+    function getAutoRefreshIntervalSeconds() {
+        return normalizeAutoRefreshIntervalSeconds(readSettings().autoRefreshIntervalSeconds);
     }
 
     // -----------------------------
@@ -302,7 +322,7 @@
             unit = "m";
         }
 
-        return isPast ? `${value}${unit} ago` : `in ${value} ${unit}`;
+        return isPast ? `${value}${unit} ago` : `in ${value}${unit}`;
     }
 
     // -----------------------------
@@ -319,6 +339,31 @@
             });
             syncRelativeRefresh();
             run();
+        });
+
+        GM_registerMenuCommand("Set auto-refresh interval", () => {
+            const cur = getAutoRefreshIntervalSeconds();
+
+            const input = prompt(
+                [
+                    "Enter the auto-refresh interval in seconds.",
+                    "",
+                    `Current: ${cur}`,
+                    `Default: ${DEFAULT_AUTO_REFRESH_INTERVAL_SECONDS}`,
+                    "",
+                    "Use 0 to disable auto-refresh.",
+                    "Values below 0 or invalid input fall back to the default."
+                ].join("\n"),
+                String(cur)
+            );
+            if (input === null) {
+                return;
+            }
+
+            writeSettings({
+                autoRefreshIntervalSeconds: Number.parseInt(input.trim(), 10)
+            });
+            startAutoRefresh();
         });
 
         GM_registerMenuCommand("Set date pattern", () => {
@@ -494,6 +539,10 @@
     const qa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
     let relativeRefreshId = null;
+    let autoRefreshId = null;
+    let softRefreshPending = false;
+    let softRefreshInFlight = false;
+    let visibilityListenerRegistered = false;
 
     function syncRelativeRefresh() {
         if (getDisplayMode() === DISPLAY_MODES.RELATIVE) {
@@ -517,13 +566,25 @@
         el.removeAttribute(RENDERED_ATTR);
     }
 
+    function replaceElementFromDocument(selector, freshDoc, mapElement = (el) => el) {
+        const current = mapElement(q(selector));
+        const fresh = mapElement(q(selector, freshDoc));
+        if (!current || !fresh) {
+            return false;
+        }
+
+        current.replaceWith(fresh.cloneNode(true));
+        return true;
+    }
+
     // -----------------------------
     // Conversion pipeline
     // -----------------------------
     function convertElement(el, {
         parse,
         sourceTz,
-        title
+        title,
+        displayMode
     }) {
         if (!el || el.nodeType !== Node.ELEMENT_NODE) {
             return false;
@@ -572,7 +633,8 @@
         }
 
         const localStr = formatLocal(new Date(utcMs), { showSeconds });
-        const displayText = getDisplayMode() === DISPLAY_MODES.RELATIVE
+        const effectiveDisplayMode = normalizeDisplayMode(displayMode ?? getDisplayMode());
+        const displayText = effectiveDisplayMode === DISPLAY_MODES.RELATIVE
             ? formatRelative(utcMs)
             : localStr;
 
@@ -627,6 +689,7 @@
                     title: (orig, tz, local) => `Original: ${orig} (interpreted as ${tz})\nLocal: ${local}`
                 });
             },
+            softRefresh: (freshDoc) => replaceElementFromDocument("#trackings", freshDoc),
         },
         {
             match: (host) => host.includes("goon-tracker.com"),
@@ -642,35 +705,130 @@
                     });
                 }
 
-                const lastSeenSpan = q(".last-seen p:nth-of-type(2) span");
+                const lastSeenSpan = q(".last-seen > h2")?.parentElement?.querySelector("p:nth-of-type(2) span");
                 if (lastSeenSpan) {
                     convertElement(lastSeenSpan, {
                         parse: parseSqlDateTime,
                         sourceTz: "America/Los_Angeles",
-                        title: (orig, tz, local) => `Original: ${orig} (interpreted as ${tz})\nLocal: ${local}`
+                        title: (orig, tz, local) => `Original: ${orig} (interpreted as ${tz})\nLocal: ${local}`,
+                        displayMode: DISPLAY_MODES.LOCAL
                     });
                 }
+            },
+            softRefresh: (freshDoc) => {
+                const tbodyChanged = replaceElementFromDocument(".table-container table tbody", freshDoc);
+                const lastSeenChanged = replaceElementFromDocument(
+                    ".last-seen > h2",
+                    freshDoc,
+                    (el) => el?.parentElement ?? null
+                );
+
+                return tbodyChanged || lastSeenChanged;
             },
         },
     ];
 
+    function getCurrentSite() {
+        const host = location.hostname;
+        return SITES.find((site) => site.match(host)) || null;
+    }
+
     function run() {
         try {
-            const host = location.hostname;
-            for (const site of SITES) {
-                if (site.match(host)) {
-                    site.run();
-                    break;
-                }
+            const site = getCurrentSite();
+            if (site) {
+                site.run();
             }
         } catch(e) {
             console.debug("[Goons Tracker - Local Times] Error:", e);
         }
     }
 
+    async function softRefreshCurrentSite() {
+        if (softRefreshInFlight) {
+            softRefreshPending = true;
+            return false;
+        }
+
+        const site = getCurrentSite();
+        if (!site || typeof site.softRefresh !== "function") {
+            return false;
+        }
+
+        softRefreshInFlight = true;
+
+        try {
+            const response = await fetch(location.href, {
+                credentials: "include",
+                cache: "no-store"
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+
+            const html = await response.text();
+            const freshDoc = new DOMParser().parseFromString(html, "text/html");
+            const changed = site.softRefresh(freshDoc);
+
+            if (!changed) {
+                console.debug("[Goons Tracker - Local Times] Auto-refresh skipped: expected content was not found in the fetched document.");
+                return false;
+            }
+
+            run();
+            return true;
+        } catch (e) {
+            console.debug("[Goons Tracker - Local Times] Auto-refresh failed:", e);
+            return false;
+        } finally {
+            softRefreshInFlight = false;
+
+            if (softRefreshPending && document.visibilityState === "visible") {
+                softRefreshPending = false;
+                void softRefreshCurrentSite();
+            }
+        }
+    }
+
+    function requestSoftRefresh() {
+        if (document.visibilityState !== "visible") {
+            softRefreshPending = true;
+            return;
+        }
+
+        softRefreshPending = false;
+        void softRefreshCurrentSite();
+    }
+
+    function startAutoRefresh() {
+        if (!visibilityListenerRegistered) {
+            document.addEventListener("visibilitychange", () => {
+                if (document.visibilityState === "visible" && softRefreshPending) {
+                    requestSoftRefresh();
+                }
+            });
+            visibilityListenerRegistered = true;
+        }
+
+        if (autoRefreshId !== null) {
+            clearInterval(autoRefreshId);
+            autoRefreshId = null;
+        }
+
+        const intervalSeconds = getAutoRefreshIntervalSeconds();
+        if (intervalSeconds === 0) {
+            softRefreshPending = false;
+            return;
+        }
+
+        autoRefreshId = setInterval(requestSoftRefresh, intervalSeconds * 1000);
+    }
+
     registerMenu();
     getDefaultPattern();
     syncRelativeRefresh();
+    startAutoRefresh();
     run();
 
     new MutationObserver(run).observe(document.documentElement, {
