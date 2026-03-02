@@ -2,13 +2,13 @@
 // @name            Goons Tracker - Local Times
 // @author          Tosox
 // @namespace       https://github.com/Tosox
-// @homepage        https://github.com/Tosox/Goons-Tracker-Local-Times
-// @supportURL      https://github.com/Tosox/Goons-Tracker-Local-Times/issues
-// @updateURL       https://github.com/Tosox/Goons-Tracker-Local-Times/releases/latest/download/goons-tracker-local-times.user.js
-// @downloadURL     https://github.com/Tosox/Goons-Tracker-Local-Times/releases/latest/download/goons-tracker-local-times.user.js
-// @icon            https://github.com/Tosox/Goons-Tracker-Local-Times/blob/master/assets/icon.png?raw=true
-// @description     Converts Goons tracker timestamps into your local time
-// @version         1.0.0
+// @homepage        https://github.com/Tosox/goons-tracker-local-times
+// @supportURL      https://github.com/Tosox/goons-tracker-local-times/issues
+// @updateURL       https://github.com/Tosox/goons-tracker-local-times/releases/latest/download/goons-tracker-local-times.user.js
+// @downloadURL     https://github.com/Tosox/goons-tracker-local-times/releases/latest/download/goons-tracker-local-times.user.js
+// @icon            https://github.com/Tosox/goons-tracker-local-times/blob/master/assets/icon.png?raw=true
+// @description     Converts Goons tracker timestamps into your local time or relative elapsed time
+// @version         1.1.0
 // @license         MIT
 // @copyright       Copyright (c) 2026 Tosox
 // @match           https://www.goon-tracker.com/*
@@ -26,7 +26,17 @@
     // -----------------------------
     const SETTINGS_KEY = "gt_local_times_settings";
     const DEFAULT_PATTERN = "dd.MM.yyyy, HH:mm:ss";
+    const DEFAULT_DISPLAY_MODE = "local";
     const PROCESSED_ATTR = "data-localized-time";
+    const ORIGINAL_ATTR = "data-localized-time-original";
+    const UTC_MS_ATTR = "data-localized-time-utc";
+    const SHOW_SECONDS_ATTR = "data-localized-time-seconds";
+    const RENDERED_ATTR = "data-localized-time-rendered";
+    const RELATIVE_REFRESH_MS = 1000;
+    const DISPLAY_MODES = {
+        LOCAL: "local",
+        RELATIVE: "relative",
+    };
 
     const ALLOWED_TOKENS = new Set([
         "yyyy", "yy",
@@ -39,24 +49,45 @@
         "a"
     ]);
 
+    function normalizeDisplayMode(value) {
+        return value === DISPLAY_MODES.RELATIVE ? DISPLAY_MODES.RELATIVE : DISPLAY_MODES.LOCAL;
+    }
+
     function readSettings() {
         const raw = GM_getValue(SETTINGS_KEY, null);
         if (!raw) {
-            return { pattern: "" };
+            return {
+                pattern: "",
+                displayMode: DEFAULT_DISPLAY_MODE
+            };
         }
 
         try {
             const obj = (typeof raw === "string" ? JSON.parse(raw) : raw);
-            return { pattern: (obj?.pattern ?? "") };
+            return {
+                pattern: (obj?.pattern ?? ""),
+                displayMode: normalizeDisplayMode(obj?.displayMode)
+            };
         } catch {
-            return { pattern: "" };
+            return {
+                pattern: "",
+                displayMode: DEFAULT_DISPLAY_MODE
+            };
         }
     }
 
     function writeSettings(next) {
-        const merged = { pattern: (next?.pattern ?? "") };
+        const current = readSettings();
+        const merged = {
+            pattern: (next?.pattern ?? current.pattern ?? ""),
+            displayMode: normalizeDisplayMode(next?.displayMode ?? current.displayMode)
+        };
         GM_setValue(SETTINGS_KEY, JSON.stringify(merged));
         return merged;
+    }
+
+    function getDisplayMode() {
+        return normalizeDisplayMode(readSettings().displayMode);
     }
 
     // -----------------------------
@@ -248,10 +279,48 @@
         return formatByPattern(date, effective);
     }
 
+    function formatRelative(utcMs) {
+        const diffMs = Date.now() - utcMs;
+        if (!Number.isFinite(diffMs)) {
+            return "0s ago";
+        }
+
+        const isPast = diffMs >= 0;
+        const totalSeconds = Math.max(0, Math.floor(Math.abs(diffMs) / 1000));
+
+        let value = totalSeconds;
+        let unit = "s";
+
+        if (totalSeconds >= 86400) {
+            value = Math.floor(totalSeconds / 86400);
+            unit = "d";
+        } else if (totalSeconds >= 3600) {
+            value = Math.floor(totalSeconds / 3600);
+            unit = "h";
+        } else if (totalSeconds >= 60) {
+            value = Math.floor(totalSeconds / 60);
+            unit = "min";
+        }
+
+        return isPast ? `${value}${unit} ago` : `in ${value} ${unit}`;
+    }
+
     // -----------------------------
     // Menu
     // -----------------------------
     function registerMenu() {
+        GM_registerMenuCommand("Toggle display mode", () => {
+            const nextDisplayMode = getDisplayMode() === DISPLAY_MODES.RELATIVE
+                ? DISPLAY_MODES.LOCAL
+                : DISPLAY_MODES.RELATIVE;
+
+            writeSettings({
+                displayMode: nextDisplayMode
+            });
+            syncRelativeRefresh();
+            run();
+        });
+
         GM_registerMenuCommand("Set date pattern", () => {
             const cur = (readSettings().pattern || "").trim();
             const def = getDefaultPattern();
@@ -424,6 +493,30 @@
     const q = (sel, root = document) => root.querySelector(sel);
     const qa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
+    let relativeRefreshId = null;
+
+    function syncRelativeRefresh() {
+        if (getDisplayMode() === DISPLAY_MODES.RELATIVE) {
+            if (relativeRefreshId === null) {
+                relativeRefreshId = setInterval(run, RELATIVE_REFRESH_MS);
+            }
+            return;
+        }
+
+        if (relativeRefreshId !== null) {
+            clearInterval(relativeRefreshId);
+            relativeRefreshId = null;
+        }
+    }
+
+    function clearStoredState(el) {
+        el.removeAttribute(PROCESSED_ATTR);
+        el.removeAttribute(ORIGINAL_ATTR);
+        el.removeAttribute(UTC_MS_ATTR);
+        el.removeAttribute(SHOW_SECONDS_ATTR);
+        el.removeAttribute(RENDERED_ATTR);
+    }
+
     // -----------------------------
     // Conversion pipeline
     // -----------------------------
@@ -436,27 +529,62 @@
             return false;
         }
 
-        if (el.getAttribute(PROCESSED_ATTR) === "1") {
-            return false;
+        const currentText = (el.textContent || "").trim();
+        const storedOriginal = el.getAttribute(ORIGINAL_ATTR);
+        const storedUtcMs = el.getAttribute(UTC_MS_ATTR);
+        const storedRendered = el.getAttribute(RENDERED_ATTR);
+
+        let original = currentText;
+        let utcMs = Number(storedUtcMs);
+        let showSeconds = el.getAttribute(SHOW_SECONDS_ATTR) === "1";
+
+        const canReuseStored = storedOriginal !== null
+            && storedUtcMs !== null
+            && storedRendered !== null
+            && currentText === storedRendered;
+
+        if (canReuseStored) {
+            original = storedOriginal;
+            if (!Number.isFinite(utcMs)) {
+                clearStoredState(el);
+                return false;
+            }
+        } else {
+            const parsed = parse(currentText);
+            if (!parsed) {
+                if (storedRendered !== null && currentText !== storedRendered) {
+                    clearStoredState(el);
+                }
+                return false;
+            }
+
+            showSeconds = originalShowsSeconds(currentText);
+            utcMs = zonedTimeToUtcMs(parsed, sourceTz);
+            if (!Number.isFinite(utcMs)) {
+                clearStoredState(el);
+                return false;
+            }
+
+            el.setAttribute(PROCESSED_ATTR, "1");
+            el.setAttribute(ORIGINAL_ATTR, currentText);
+            el.setAttribute(UTC_MS_ATTR, String(utcMs));
+            el.setAttribute(SHOW_SECONDS_ATTR, showSeconds ? "1" : "0");
         }
 
-        const original = (el.textContent || "").trim();
-        const parsed = parse(original);
-        if (!parsed) {
-            return false;
-        }
-
-        const showSeconds = originalShowsSeconds(original);
-
-        const utcMs = zonedTimeToUtcMs(parsed, sourceTz);
         const localStr = formatLocal(new Date(utcMs), { showSeconds });
+        const displayText = getDisplayMode() === DISPLAY_MODES.RELATIVE
+            ? formatRelative(utcMs)
+            : localStr;
 
-        el.textContent = localStr;
+        if (currentText !== displayText) {
+            el.textContent = displayText;
+        }
+
+        el.setAttribute(RENDERED_ATTR, displayText);
         if (title) {
             el.title = title(original, sourceTz, localStr);
         }
 
-        el.setAttribute(PROCESSED_ATTR, "1");
         return true;
     }
 
@@ -496,7 +624,7 @@
                 convertElements(tds, {
                     parse: parseTarkovGoon,
                     sourceTz: "America/New_York",
-                    title: (orig, tz) => `Original: ${orig} (interpreted as ${tz})`
+                    title: (orig, tz, local) => `Original: ${orig} (interpreted as ${tz})\nLocal: ${local}`
                 });
             },
         },
@@ -510,7 +638,7 @@
                     convertElements(tds, {
                         parse: parseSqlDateTime,
                         sourceTz: "America/Los_Angeles",
-                        title: (orig, tz) => `Original: ${orig} (interpreted as ${tz})`
+                        title: (orig, tz, local) => `Original: ${orig} (interpreted as ${tz})\nLocal: ${local}`
                     });
                 }
 
@@ -519,7 +647,7 @@
                     convertElement(lastSeenSpan, {
                         parse: parseSqlDateTime,
                         sourceTz: "America/Los_Angeles",
-                        title: (orig, tz) => `Original: ${orig} (interpreted as ${tz})`
+                        title: (orig, tz, local) => `Original: ${orig} (interpreted as ${tz})\nLocal: ${local}`
                     });
                 }
             },
@@ -542,6 +670,7 @@
 
     registerMenu();
     getDefaultPattern();
+    syncRelativeRefresh();
     run();
 
     new MutationObserver(run).observe(document.documentElement, {
